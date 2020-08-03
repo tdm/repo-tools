@@ -1,0 +1,638 @@
+#!/usr/bin/python
+
+import os
+import sys
+import time
+import errno
+import string
+import argparse
+import tempfile
+from subprocess import Popen, PIPE
+from xml.etree import ElementTree
+from zipfile import ZipFile, ZIP_DEFLATED
+
+EEOL = "\x1b[0K"
+if sys.stdout.isatty():
+  spfx = '\r'
+  ssfx = EEOL
+else:
+  spfx = ''
+  ssfx = '\n'
+
+args = None
+
+def logi(msg):
+  sys.stdout.write("%s\n" % (msg.rstrip('\n')))
+  sys.stdout.flush()
+
+def loge(msg):
+  sys.stderr.write("%s\n" % (msg.rstrip('\n')))
+
+def logv(level, msg):
+  if args.verbose >= level:
+    logi(msg)
+
+def readfile(filename):
+  f = open(filename, 'r')
+  buf = f.read()
+  f.close()
+  return buf
+
+def writefile(filename, buf):
+  f = open(filename, 'w')
+  f.write(buf)
+  f.close()
+
+def mkdir_p(path):
+  parent = os.path.dirname(path)
+  if parent and not os.path.isdir(parent):
+    mkdir_p(parent)
+  try:
+    os.mkdir(path)
+  except OSError as e:
+    if e.errno != errno.EEXIST:
+      raise
+
+def rmtree(path):
+  for root, dirs, files in os.walk(path):
+    for dirname in dirs:
+      rmtree("%s/%s" % (root, dirname))
+    for filename in files:
+      os.unlink("%s/%s" % (root, filename))
+  os.rmdir(path)
+
+def syscmd(argv, stdin=None, expect_rc=0):
+  try:
+    child = Popen(argv, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+  except BaseException as e:
+    sys.stderr.write("Failed to run %s: %s\n" % (argv, str(e)))
+    sys.exit(1)
+  if stdin is not None:
+    child.stdin.write(stdin)
+  (out, err) = child.communicate()
+  rc = child.returncode
+  if rc != expect_rc:
+    raise RuntimeError("Failed to run %s: rc=%d" % (argv, rc))
+  return (out, err)
+
+def gitcmd(dir, argv, stdin=None, expect_rc=0):
+  git_argv = ['git']
+  if dir is not None:
+    git_argv.extend(['-C', dir])
+  git_argv.extend(argv)
+  (out, err) = syscmd(git_argv, None, expect_rc)
+  return out
+
+def is_sha1(s):
+  if len(s) != 40:
+    return False
+  for c in s:
+    if not c in string.hexdigits:
+      return False
+  return True
+
+def git_ref_to_rev(remote, ref):
+  if ref.startswith('refs/'):
+    segs = ref.split('/')
+    if segs[1] == 'heads':
+      branch = '/'.join(segs[2:])
+      rev = "%s/%s" % (remote, branch)
+    elif segs[1] == 'tags':
+      segs = ref.split('/')
+      tag = '/'.join(segs[2:])
+      rev = "%s^0" % (tag)
+    else:
+      raise RuntimeError("Unknown ref type: %s" % (ref))
+  else:
+    if is_sha1(ref):
+      rev = ref
+    else:
+      rev = "%s/%s" % (remote, ref)
+  return rev
+
+class Archiver:
+  @classmethod
+  def instance(cls, location, mode):
+    if location.endswith('.zip'):
+      return ZipArchiver(location, mode)
+    else:
+      return FilesystemArchiver(location, mode)
+
+  def listdir(self, dirname):
+    raise NotImplementedError()
+
+  def extractdir(self, srcdir, dstdir, recursive=False):
+    raise NotImplementedError()
+
+  def read(self, pathname):
+    raise NotImplementedError()
+
+  def write(self, pathname, buf):
+    raise NotImplementedError()
+
+  def close(self):
+    raise NotImplementedError()
+
+class ZipArchiver(Archiver):
+  def __init__(self, filename, mode):
+    self._zip = ZipFile(filename, mode, ZIP_DEFLATED)
+
+  def listdir(self, dirname):
+    res = set()
+    prefix = dirname
+    if not prefix.endswith('/'):
+      prefix += '/'
+    prefixlen = len(prefix)
+    for srcfile in self._zip.namelist():
+      if not srcfile.startswith(prefix):
+        continue
+      relname = srcfile[prefixlen:]
+      res.add(relname.split('/', 1)[0])
+    return list(res)
+
+  def extractdir(self, srcdir, dstdir, recursive=False):
+    prefix = srcdir
+    if not prefix.endswith('/'):
+      prefix += '/'
+    prefixlen = len(prefix)
+    for srcfile in self._zip.namelist():
+      if not srcfile.startswith(prefix):
+        continue
+      relname = srcfile[prefixlen:]
+      if not recursive and relname.find('/') != -1:
+        continue
+      dstfile = "%s/%s" % (dstdir, relname)
+      f = self._zip.open(srcfile)
+      buf = f.read()
+      f.close()
+      mkdir_p(os.path.dirname(dstfile))
+      writefile(dstfile, buf)
+
+  def read(self, pathname):
+    try:
+      f = self._zip.open(pathname)
+      buf = f.read()
+      f.close()
+    except KeyError:
+      raise IOError(errno.ENOENT, "No such file or directory: %s" % (pathname))
+    return buf
+
+  def write(self, pathname, buf):
+    f = self._zip.writestr(pathname, buf)
+
+  def close(self):
+    self._zip.close()
+
+class FilesystemArchiver(Archiver):
+  def __init__(self, dirname, mode):
+    self._dirname = dirname
+    self._mode = mode
+    if mode == 'r':
+      if not os.path.isdir(dirname):
+        raise IOError("Directory %s does not exist" % (dirname))
+    else:
+      mkdir_p(dirname)
+
+  def listdir(self, dirname):
+    try:
+      res = os.listdir("%s/%s" % (self._dirname, dirname))
+    except OSError as e:
+      if e.errno != errno.ENOENT:
+        raise
+      res = []
+    return res
+
+  def extractdir(self, srcdir, dstdir, recursive=False):
+    mkdir_p(dstdir)
+    for name in self.listdir(srcdir):
+      srcname = "%s/%s/%s" % (self._dirname, srcdir, name)
+      dstname = "%s/%s" % (dstdir, name)
+      if os.path.isdir(srcname):
+        if recursive:
+          srcsubdir = "%s/%s" % (srcdir, name)
+          dstsubdir = "%s/%s" % (dstdir, name)
+          self.extractdir(srcsubdir, dstsubdir, True)
+      else:
+        f = open(srcname, 'r')
+        buf = f.read()
+        f.close()
+        f = open(dstname, 'w')
+        f.write(buf)
+        f.close()
+
+  def read(self, pathname):
+    full_pathname = "%s/%s" % (self._dirname, pathname)
+    f = open(full_pathname, 'r')
+    buf = f.read()
+    f.close()
+    return buf
+
+  def write(self, pathname, buf):
+    if self._mode == 'r':
+      raise IOError("Cannot write in read-only mode")
+    full_pathname = "%s/%s" % (self._dirname, pathname)
+    mkdir_p(os.path.dirname(full_pathname))
+    f = open(full_pathname, 'w')
+    f.write(buf)
+    f.close()
+
+class Project:
+  def _gitcmd(self, argv, expect_rc=0):
+    return gitcmd(self.path(), argv, None, expect_rc)
+
+  def __init__(self, path, remote_name, remote_ref):
+    self._path = path
+    self._remote_name = remote_name
+    self._remote_ref = remote_ref
+
+  def _get_info(self):
+    # Find revision for local HEAD
+    self._local_rev = self._gitcmd(['rev-parse', 'HEAD^0']).strip()
+
+    # Find revision for remote ref
+    self._remote_rev = self._gitcmd(['rev-parse', self._remote_ref]).strip()
+
+    # Find local branch names and revs
+    self._local_branches = dict()
+    cmdbuf = self._gitcmd(['branch'])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        if line.startswith('* '):
+          line = line[2:]
+        branch = line.strip()
+        if branch.startswith('('):
+          continue
+        rev = self._gitcmd(['rev-parse', branch])
+        self._local_branches[branch] = rev
+
+    # Find remotes
+    self._remotes = dict()
+    cmdbuf = self._gitcmd(['remote', '-v'])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        fields = line.split()
+        name = fields[0]
+        url = fields[1]
+        if name != self._remote_name:
+          self._remotes[name] = url
+
+    # Find remote branch names and revs
+    self._remote_branches = dict()
+    cmdbuf = self._gitcmd(['branch', '-r'])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        if line.find('->') != -1:
+          continue
+        branch = line.strip()
+        rev = self._gitcmd(['rev-parse', branch]).strip()
+        self._remote_branches[branch] = rev
+
+    # Find tags and revs
+    self._tags = dict()
+    cmdbuf = self._gitcmd(['tag', '-l'])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        tag = line.strip()
+        rev = self._gitcmd(['rev-parse', "%s^0" % (tag)]).strip()
+        self._tags[tag] = rev
+
+    self._required_remote_branches = set()
+
+  def path(self):
+    return self._path
+
+  def detached_head(self):
+    ref = self._gitcmd(['rev-parse', '--abbrev-ref', 'HEAD']).strip()
+    return ref == 'HEAD'
+
+  def branch_base(self, branch):
+    cmdbuf = self._gitcmd(['log', '--pretty=format:%H', branch])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        for name, hash in self._remote_branches.items():
+          if line == hash:
+            return (name, hash)
+        for name, hash in self._tags.items():
+          if line == hash:
+            return (name, hash)
+    raise RuntimeError("Cannot find base for project %s branch %s" % (self._path, branch))
+
+  def backup_branch(self, archiver, branch):
+    dir = "%s/local_branches/%s" % (self.path(), branch)
+    (base_name, base_hash) = self.branch_base(branch)
+    if base_name != self._remote_ref:
+      self._required_remote_branches.add(base_name)
+    buf = "%s %s\n" % (base_name, base_hash)
+    archiver.write("%s/.base" % (dir), buf)
+    revision_range = "%s..%s" % (base_hash, branch)
+    tmpdir = tempfile.mkdtemp()
+    self._gitcmd(['format-patch', '-o', tmpdir, revision_range])
+    for name in os.listdir(tmpdir):
+      buf = readfile("%s/%s" % (tmpdir, name))
+      archiver.write("%s/%s" % (dir, name), buf)
+    rmtree(tmpdir)
+
+  def backup(self, archiver):
+    self._get_info()
+
+    # Remotes
+    if self._remotes:
+      buf = ''
+      for k, v in self._remotes.items():
+        buf += "%s %s\n" % (k, v)
+      archiver.write("%s/remotes" % (self.path()), buf)
+
+    # Local commits
+    if self.detached_head() and self._local_rev != self._remote_rev:
+      self.backup_branch(archiver, 'HEAD')
+    # Local branches
+    for branch, rev in self._local_branches.items():
+      self.backup_branch(archiver, branch)
+
+    # Remote branches
+    if self._required_remote_branches:
+      buf = ''
+      for branch in self._required_remote_branches:
+        buf += "%s\n" % (branch)
+      archiver.write("%s/remote_branches" % (self.path()), buf)
+
+    # head
+    head = self._gitcmd(['rev-parse', '--abbrev-ref', 'HEAD']).strip()
+    if head == 'HEAD':
+      head = self._gitcmd(['rev-parse', 'HEAD']).strip()
+    if head != self._remote_rev:
+      archiver.write("%s/head" % (self.path()), "%s\n" % (head))
+
+    # Local changes
+    diff = self._gitcmd(['diff'])
+    filenames = []
+    cmdbuf = self._gitcmd(['status', '--short', '--untracked-files'])
+    if cmdbuf:
+      for line in cmdbuf.rstrip('\n').split('\n'):
+        fields = line.split(' ', 1)
+        filenames.append(fields[1])
+    if diff.strip() or filenames:
+      buf = diff
+      for filename in filenames:
+        buf += self._gitcmd(['diff', '--binary', '/dev/null', filename], 1)
+      archiver.write("%s/diff" % (self.path()), buf)
+
+  def restore_branch(self, archiver, branch):
+    dir = "%s/local_branches/%s" % (self.path(), branch)
+    buf = archiver.read("%s/.base" % (dir))
+    (base_name, base_hash) = buf.rstrip('\n').split(' ', 1)
+    self._gitcmd(['checkout', base_hash])
+    if branch != 'HEAD':
+      if branch in self._local_branches:
+        if not args.force:
+          raise RuntimeError("Project %s already has local branch %s" % (self._path, branch))
+        self._gitcmd(['branch', '-D', branch])
+      self._gitcmd(['checkout', '-b', branch])
+    tmpdir = tempfile.mkdtemp()
+    archiver.extractdir(dir, tmpdir)
+    argv = ['am']
+    files = os.listdir(tmpdir)
+    for filename in sorted(files):
+      if filename.endswith('.patch'):
+        argv.append("%s/%s" % (tmpdir, filename))
+    if len(argv) > 1:
+      self._gitcmd(argv)
+    rmtree(tmpdir)
+
+  def restore(self, archiver):
+    self._get_info()
+
+    # Ensure a clean tree
+    buf = self._gitcmd(['status', '--short'])
+    if buf:
+      if not args.force:
+        raise RuntimeError("Project %s has local changes" % (self._path))
+      self._gitcmd(['reset', '--hard', 'HEAD'])
+      for line in buf.rstrip('\n').split('\n'):
+        (status, filename) = line.split(' ', 1)
+        if status == '??':
+          os.unlink("%s/%s" % (self._path, filename))
+
+    # Remotes
+    try:
+      buf = archiver.read("%s/remotes" % (self.path()))
+      for line in buf.rstrip('\n').split('\n'):
+        (name, url) = line.split(' ', 1)
+        if name in self._remotes:
+          if url != self._remotes[name]:
+            if not args.force:
+              raise RuntimeError("Project %s has remote %s but different url" % (self._path, name))
+            self._gitcmd(['remote', 'set-url', name, url])
+        else:
+          self._gitcmd(['remote', 'add', name, url])
+    except IOError:
+      pass
+
+    # Remote branches
+    try:
+      buf = archiver.read("%s/remote_branches" % (self.path()))
+      for line in buf.rstrip('\n').split('\n'):
+        branch = line
+        (remote_name, remote_ref) = branch.split('/', 1)
+        # Remote branches may not exist
+        try:
+          self._gitcmd(['fetch', remote_name, remote_ref])
+        except RuntimeError:
+          pass
+    except IOError:
+      pass
+
+    # Local branches
+    branches = archiver.listdir("%s/local_branches" % (self.path()))
+    try:
+      for branch in archiver.listdir("%s/local_branches" % (self.path())):
+        self.restore_branch(archiver, branch)
+    except OSError:
+      pass
+
+    try:
+      rev = archiver.read("%s/head" % (self.path())).rstrip('\n')
+    except IOError as e:
+      if e.errno != errno.ENOENT:
+        raise
+      rev = self._remote_ref
+    self._gitcmd(['checkout', rev])
+
+    # Local changes
+    try:
+      buf = archiver.read("%s/diff" % (self.path()))
+      syscmd(['patch', '-d', self._path, '-p', '1'], buf)
+    except IOError:
+      pass
+
+class Repo:
+  def _get_projects(self):
+    logv(1, "Finding projects...")
+    t = time.time()
+    self._projects = dict()
+    argv = ['repo', 'manifest']
+    (out, err) = syscmd(argv)
+    manifest = ElementTree.fromstring(out)
+    remotes = dict()
+    for elem in manifest.findall('remote'):
+      remotes[elem.get('name')] = elem
+    default = manifest.find('default')
+    for elem in manifest.findall('project'):
+      project_name = elem.get('name')
+      if project_name is None:
+        raise RuntimeError("Project without name")
+      project_path = elem.get('path')
+      if project_path is None:
+        project_path = project_name
+      project_remote = elem.get('remote')
+      if project_remote is None:
+        project_remote = default.get('remote')
+      if project_remote is None:
+        raise RuntimeError("Failed to get remote for %s" % (project_name))
+      project_ref = elem.get('revision')
+      if project_ref is None:
+        project_ref = remotes[project_remote].get('revision')
+        if project_ref is None:
+          project_ref = default.get('revision')
+      if project_ref is None:
+        raise RuntimeError("Failed to get ref for %s" % (project_name))
+      project_rev = git_ref_to_rev(project_remote, project_ref)
+      project = Project(project_path, project_remote, project_rev)
+      self._projects[project_path] = project
+      now = time.time()
+      if now >= t + 1.0:
+        sys.stdout.write("\r%d found" % (len(self._projects)))
+        sys.stdout.flush()
+        t = now
+    sys.stdout.write("\rFound %d projects\n" % (len(self._projects)))
+
+  def backup(self, archiver):
+    argv = ['config', '-f', '.repo/manifests.git/config', 'remote.origin.url']
+    self._url = gitcmd(None, argv).strip()
+    argv = ['config', '-f', '.repo/manifests.git/config', 'branch.default.merge']
+    self._ref = gitcmd(None, argv).strip()
+
+    buf = ''
+    buf += "url=%s\n" % (self._url)
+    buf += "ref=%s\n" % (self._ref)
+    archiver.write('config', buf)
+
+    try:
+      for name in os.listdir(".repo/local_manifests"):
+        src_filename = ".repo/local_manifests/%s" % (name)
+        dst_filename = ".local_manifests/%s" % (name)
+        if not os.path.isfile(src_filename):
+          continue
+        buf = readfile(src_filename)
+        archiver.write(dst_filename, buf)
+    except OSError as e:
+      if e.errno != errno.ENOENT:
+        raise
+
+    self._get_projects()
+
+    if args.projects:
+      project_names = args.projects
+    else:
+      project_names = sorted(self._projects.keys())
+    n = 0
+    for name in project_names:
+      project = self._projects[name]
+      n += 1
+      sys.stdout.write("%s[%d of %d] Backup %s%s" %
+                       (spfx, n, len(project_names), project.path(), ssfx))
+      sys.stdout.flush()
+      project.backup(archiver)
+    sys.stdout.write("%sDone with backup%s\n" % (spfx, ssfx))
+
+  def restore(self, archiver):
+    buf = archiver.read("config")
+    for line in buf.rstrip('\n').split('\n'):
+      (k, v) = line.rstrip('\n').split('=', 1)
+      if k == 'url':
+        self._url = v
+      if k == 'ref':
+        self._ref = v
+    if os.path.exists('.repo'):
+      argv = ['config', '-f', '.repo/manifests.git/config', 'remote.origin.url']
+      existing_url = gitcmd(None, argv).strip()
+      argv = ['config', '-f', '.repo/manifests.git/config', 'branch.default.merge']
+      existing_ref = gitcmd(None, argv).strip()
+      if existing_url != self._url or existing_ref != self._ref:
+        raise RuntimeError("Existing repo does not match saved repo")
+      if os.path.exists('.repo/local_manifests'):
+        if not args.force:
+          raise RuntimeError("Existing repo has local manifests")
+        rmtree('.repo/local_manifests')
+    else:
+      syscmd(['repo', 'init', '-u', self._url, '-b', self._ref])
+
+    sys.stdout.write("Restoring local manifests...\n")
+    sys.stdout.flush()
+    src_dir = "%s/.local_manifests" % (args.backup)
+    dst_dir = ".repo/local_manifests"
+    mkdir_p(dst_dir)
+    for name in archiver.listdir('.local_manifests'):
+      src_filename = ".local_manifests/%s" % (name)
+      dst_filename = "%s/%s" % (dst_dir, name)
+      buf = archiver.read(src_filename)
+      writefile(dst_filename, buf)
+
+    sys.stdout.write("Syncing repo...\n")
+    sys.stdout.flush()
+    argv = ['repo', 'sync']
+    if args.projects:
+      argv.extend(args.projects)
+    syscmd(argv)
+
+    self._get_projects()
+
+    if args.projects:
+      project_names = args.projects
+    else:
+      project_names = sorted(self._projects.keys())
+    n = 0
+    for name in project_names:
+      project = self._projects[name]
+      n += 1
+      sys.stdout.write("%s[%d of %d] Restore %s%s" %
+                       (spfx, n, len(project_names), project.path(), ssfx))
+      sys.stdout.flush()
+      project.restore(archiver)
+    sys.stdout.write("%sDone with restore%s\n" % (spfx, ssfx))
+
+parser = argparse.ArgumentParser(description='Archive a repo tree')
+parser.add_argument('-v', '--verbose', action='count', default=0,
+                    help='Increase verbosity')
+parser.add_argument('-f', '--force', action='store_true',
+                    help='Force deletion of existing objects')
+parser.add_argument('-b', '--backup', default='archive.zip',
+                    help='Location of backup (zipfile or directory) [archive.zip]')
+parser.add_argument('-r', '--repo',
+                    help='Location of repo tree [$PWD]')
+parser.add_argument('action', choices=['backup', 'restore'], nargs=1)
+parser.add_argument('projects', nargs='*')
+args = parser.parse_args()
+
+pwd = os.getcwd()
+
+if args.repo:
+  mkdir_p(args.repo)
+  os.chdir(args.repo)
+
+if args.action[0] == 'backup':
+  if os.path.exists(args.backup):
+    if not args.force:
+      sys.stderr.write("%s already exists\n" % (args.backup))
+      sys.exit(1)
+    if os.path.isdir(args.backup):
+      rmtree(args.backup)
+    else:
+      os.unlink(args.backup)
+  archiver = Archiver.instance(args.backup, 'w')
+  repo = Repo()
+  repo.backup(archiver)
+if args.action[0] == 'restore':
+  archiver = Archiver.instance(args.backup, 'r')
+  repo = Repo()
+  repo.restore(archiver)
